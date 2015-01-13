@@ -695,229 +695,376 @@ func (engine *Engine) mapType(v reflect.Value) *core.Table {
 		}
 	}
 
+
 	if table.Name == "" {
 		table.Name = engine.TableMapper.Obj2Table(t.Name())
 	}
 	table.Type = t
+	////////////////////////////////
+	return engine.buildTableColumns(table, v)
 
-	var idFieldColName string
+	
+}
+
+//创建匿名类型表列
+func (engine *Engine) buildAnonymousType(
+	table *core.Table,
+	structField reflect.StructField,
+	idFieldColName string) (resultTable *core.Table, resultIdFieldColName string) {
+
+	ormTagStr := structField.Tag.Get(engine.TagIdentifier)
+	if ormTagStr == "-" {
+		resultTable = table
+		resultIdFieldColName = idFieldColName
+		return resultTable, resultIdFieldColName
+	}
+
+	num := structField.Type.NumField()
+
+	var hasCacheTag = false
+	var hasNoCacheTag = false
+
+	for i := 0; i < num; i++ {
+
+		currentStructField := structField.Type.Field(i)
+		ormTagStr := currentStructField.Tag.Get(engine.TagIdentifier)
+		if ormTagStr == "-" {
+			continue
+		}
+
+		fieldValue := rValue(currentStructField)
+		fieldType := fieldValue.Type()
+
+		if currentStructField.Anonymous {
+			table, idFieldColName = engine.buildAnonymousType(table, currentStructField, idFieldColName)
+		} else {
+
+			table, hasCacheTag, hasNoCacheTag, idFieldColName = engine.buildColumn(table, currentStructField, ormTagStr, fieldValue, fieldType, hasCacheTag, hasNoCacheTag, idFieldColName)
+		}
+
+	}
+	resultTable = table
+	resultIdFieldColName = idFieldColName
+	return resultTable, resultIdFieldColName
+
+}
+
+func (engine *Engine) isStruct(typeStr string) bool {
+	slice := []string{
+		reflect.Int.String(),
+		reflect.Int8.String(), reflect.Int16.String(), reflect.Int32.String(), reflect.Int64.String(),
+		reflect.Uint.String(), reflect.Uint8.String(), reflect.Uint16.String(), reflect.Uint32.String(), reflect.Uint64.String(),
+		reflect.Bool.String(),
+		reflect.Float32.String(), reflect.Float64.String(),
+		"StructField"}
+	for _, t := range slice {
+		if typeStr == t {
+			return false
+		}
+	}
+	return true
+
+}
+
+func (engine *Engine) buildColumn(
+	table *core.Table,
+	currentStructField reflect.StructField,
+	ormTagStr string,
+	fieldValue reflect.Value,
+	fieldType reflect.Type,
+
+	hasCacheTag bool,
+	hasNoCacheTag bool,
+	idFieldColName string) (t *core.Table, resultHasCacheTag bool, resultHasNoCacheTag bool, resultIdFieldColName string) {
+
+	var col *core.Column
+
+	if currentStructField.Anonymous {
+
+		table, idFieldColName = engine.buildAnonymousType(table, currentStructField, idFieldColName)
+		return table, hasCacheTag, hasNoCacheTag, idFieldColName
+
+	}
+
+	if ormTagStr == "" {
+		col = engine.settingDefaultColumnConfig(col, currentStructField)
+	} else {
+		table, col, hasCacheTag, hasNoCacheTag = engine.settingColumnByTag(table, col, currentStructField, fieldValue, fieldType, ormTagStr, hasCacheTag, hasNoCacheTag)
+	}
+
+	if col.IsAutoIncrement {
+		col.Nullable = false
+	}
+
+	table.AddColumn(col)
+	//build column end
+
+	if currentStructField.Type.Kind() == reflect.Int64 && (col.FieldName == "Id" || strings.HasSuffix(col.FieldName, ".Id")) {
+		idFieldColName = col.Name
+	} else if fieldType.Kind() == reflect.Int64 && (col.FieldName == "Id" || strings.HasSuffix(col.FieldName, ".Id")) {
+		idFieldColName = col.Name
+	}
+
+	t = table
+
+	return t, hasCacheTag, hasNoCacheTag, idFieldColName
+}
+
+func (engine *Engine) tagsIsValid(tags []string) bool {
+	if len(tags) <= 0 {
+		return false
+	}
+	if tags[0] == "-" {
+		return false
+	}
+	return true
+}
+
+//根据tag设置列
+func (engine *Engine) settingColumnByTag(
+	table *core.Table,
+	col *core.Column,
+	currentStructField reflect.StructField,
+	fieldValue reflect.Value,
+	fieldType reflect.Type,
+	ormTagStr string,
+	hasCacheTag bool,
+	hasNoCacheTag bool) (t *core.Table, c *core.Column, resultHasCacheTag bool, resultHasNoCacheTag bool) {
 	var err error
+	col = &core.Column{
+		FieldName:       currentStructField.Name,
+		Nullable:        true,
+		IsPrimaryKey:    false,
+		IsAutoIncrement: false,
+		MapType:         core.TWOSIDES,
+		Indexes:         make(map[string]bool)}
 
+	tags := strings.Split(ormTagStr, " ")
+
+	if !engine.tagsIsValid(tags) {
+		//resultIdFieldColName = idFieldColName
+		return table, col, hasCacheTag, hasNoCacheTag //, resultIdFieldColName
+	}
+
+	//build column by tag begin
+
+	if strings.ToUpper(tags[0]) == "EXTENDS" {
+		if fieldValue.Kind() == reflect.Struct {
+			parentTable := engine.mapType(fieldValue)
+			for _, col := range parentTable.Columns() {
+				col.FieldName = fmt.Sprintf("%v.%v", currentStructField.Name, col.FieldName)
+				table.AddColumn(col)
+			}
+			//resultIdFieldColName = idFieldColName
+			return table, col, hasCacheTag, hasNoCacheTag //, resultIdFieldColName
+		} else if fieldValue.Kind() == reflect.Ptr {
+			f := fieldValue.Type().Elem()
+			if f.Kind() == reflect.Struct {
+				fieldValue = fieldValue.Elem()
+				if !fieldValue.IsValid() || fieldValue.IsNil() {
+					fieldValue = reflect.New(f).Elem()
+				}
+			}
+
+			parentTable := engine.mapType(fieldValue)
+			for _, col := range parentTable.Columns() {
+				col.FieldName = fmt.Sprintf("%v.%v", currentStructField.Name, col.FieldName)
+				table.AddColumn(col)
+			}
+			//resultIdFieldColName = idFieldColName
+			return table, col, hasCacheTag, hasNoCacheTag //, resultIdFieldColName
+		}
+		//TODO: warning
+	}
+
+	indexNames := make(map[string]int)
+	var isIndex, isUnique bool
+	var preKey string
+	for j, key := range tags {
+		k := strings.ToUpper(key)
+		switch {
+		case k == "<-":
+			col.MapType = core.ONLYFROMDB
+		case k == "->":
+			col.MapType = core.ONLYTODB
+		case k == "PK":
+			col.IsPrimaryKey = true
+			col.Nullable = false
+		case k == "NULL":
+			col.Nullable = (strings.ToUpper(tags[j-1]) != "NOT")
+		/*case strings.HasPrefix(k, "AUTOINCR(") && strings.HasSuffix(k, ")"):
+		col.IsAutoIncrement = true
+
+		autoStart := k[len("AUTOINCR")+1 : len(k)-1]
+		autoStartInt, err := strconv.Atoi(autoStart)
+		if err != nil {
+			engine.LogError(err)
+		}
+		col.AutoIncrStart = autoStartInt*/
+		case k == "AUTOINCR":
+			col.IsAutoIncrement = true
+			//col.AutoIncrStart = 1
+		case k == "DEFAULT":
+			col.Default = tags[j+1]
+		case k == "CREATED":
+			col.IsCreated = true
+		case k == "VERSION":
+			col.IsVersion = true
+			col.Default = "1"
+		case k == "UPDATED":
+			col.IsUpdated = true
+		case k == "DELETED":
+			col.IsDeleted = true
+		case strings.HasPrefix(k, "INDEX(") && strings.HasSuffix(k, ")"):
+			indexName := k[len("INDEX")+1 : len(k)-1]
+			indexNames[indexName] = core.IndexType
+		case k == "INDEX":
+			isIndex = true
+		case strings.HasPrefix(k, "UNIQUE(") && strings.HasSuffix(k, ")"):
+			indexName := k[len("UNIQUE")+1 : len(k)-1]
+			indexNames[indexName] = core.UniqueType
+		case k == "UNIQUE":
+			isUnique = true
+		case k == "NOTNULL":
+			col.Nullable = false
+		case k == "CACHE":
+			if !hasCacheTag {
+				hasCacheTag = true
+			}
+		case k == "NOCACHE":
+			if !hasNoCacheTag {
+				hasNoCacheTag = true
+			}
+		case k == "NOT":
+		default:
+			if strings.HasPrefix(k, "'") && strings.HasSuffix(k, "'") {
+				if preKey != "DEFAULT" {
+					col.Name = key[1 : len(key)-1]
+				}
+			} else if strings.Contains(k, "(") && strings.HasSuffix(k, ")") {
+				fs := strings.Split(k, "(")
+
+				if _, ok := core.SqlTypes[fs[0]]; !ok {
+					preKey = k
+					continue
+				}
+				col.SQLType = core.SQLType{fs[0], 0, 0}
+				if fs[0] == core.Enum && fs[1][0] == '\'' { //enum
+					options := strings.Split(fs[1][0:len(fs[1])-1], ",")
+					col.EnumOptions = make(map[string]int)
+					for k, v := range options {
+						v = strings.TrimSpace(v)
+						v = strings.Trim(v, "'")
+						col.EnumOptions[v] = k
+					}
+				} else if fs[0] == core.Set && fs[1][0] == '\'' { //set
+					options := strings.Split(fs[1][0:len(fs[1])-1], ",")
+					col.SetOptions = make(map[string]int)
+					for k, v := range options {
+						v = strings.TrimSpace(v)
+						v = strings.Trim(v, "'")
+						col.SetOptions[v] = k
+					}
+				} else {
+					fs2 := strings.Split(fs[1][0:len(fs[1])-1], ",")
+					if len(fs2) == 2 {
+						col.Length, err = strconv.Atoi(fs2[0])
+						if err != nil {
+							engine.LogError(err)
+						}
+						col.Length2, err = strconv.Atoi(fs2[1])
+						if err != nil {
+							engine.LogError(err)
+						}
+					} else if len(fs2) == 1 {
+						col.Length, err = strconv.Atoi(fs2[0])
+						if err != nil {
+							engine.LogError(err)
+						}
+					}
+				}
+			} else {
+				if _, ok := core.SqlTypes[k]; ok {
+					col.SQLType = core.SQLType{k, 0, 0}
+				} else if key != col.Default {
+					col.Name = key
+				}
+			}
+			engine.dialect.SqlType(col)
+		}
+		preKey = k
+	}
+	if col.SQLType.Name == "" {
+		col.SQLType = core.Type2SQLType(fieldType)
+	}
+	if col.Length == 0 {
+		col.Length = col.SQLType.DefaultLength
+	}
+	if col.Length2 == 0 {
+		col.Length2 = col.SQLType.DefaultLength2
+	}
+
+	if col.Name == "" {
+		col.Name = engine.ColumnMapper.Obj2Table(currentStructField.Name)
+	}
+
+	if isUnique {
+		indexNames[col.Name] = core.UniqueType
+	} else if isIndex {
+		indexNames[col.Name] = core.IndexType
+	}
+
+	for indexName, indexType := range indexNames {
+		addIndex(indexName, table, col, indexType)
+	}
+
+	t = table
+	c = col
+	//resultIdFieldColName = idFieldColName
+	return t, c, hasCacheTag, hasNoCacheTag //, resultIdFieldColName
+
+}
+
+//设置默认列配置
+func (engine *Engine) settingDefaultColumnConfig(
+	col *core.Column,
+	currentStructField reflect.StructField,
+) *core.Column {
+
+	var sqlType core.SQLType = core.Type2SQLType(currentStructField.Type)
+
+	col = core.NewColumn(engine.ColumnMapper.Obj2Table(currentStructField.Name),
+		currentStructField.Name, sqlType, sqlType.DefaultLength,
+		sqlType.DefaultLength2, true)
+
+	return col
+}
+
+//创建表列
+func (engine *Engine) buildTableColumns(table *core.Table, v reflect.Value) *core.Table {
+	var idFieldColName string
+
+	t := table.Type
 	hasCacheTag := false
 	hasNoCacheTag := false
 
 	for i := 0; i < t.NumField(); i++ {
-		tag := t.Field(i).Tag
-
+		currentStructField := t.Field(i)
+		tag := currentStructField.Tag
 		ormTagStr := tag.Get(engine.TagIdentifier)
-		var col *core.Column
+
 		fieldValue := v.Field(i)
+
 		fieldType := fieldValue.Type()
 
-		if ormTagStr != "" {
-			col = &core.Column{FieldName: t.Field(i).Name, Nullable: true, IsPrimaryKey: false,
-				IsAutoIncrement: false, MapType: core.TWOSIDES, Indexes: make(map[string]bool)}
-			tags := strings.Split(ormTagStr, " ")
+		table, hasCacheTag, hasNoCacheTag, idFieldColName = engine.buildColumn(
+			table,
+			currentStructField,
+			ormTagStr,
+			fieldValue, fieldType,
+			hasCacheTag, hasNoCacheTag,
+			idFieldColName)
 
-			if len(tags) > 0 {
-				if tags[0] == "-" {
-					continue
-				}
-				if strings.ToUpper(tags[0]) == "EXTENDS" {
-					if fieldValue.Kind() == reflect.Struct {
-						parentTable := engine.mapType(fieldValue)
-						for _, col := range parentTable.Columns() {
-							col.FieldName = fmt.Sprintf("%v.%v", t.Field(i).Name, col.FieldName)
-							table.AddColumn(col)
-						}
-
-						continue
-					} else if fieldValue.Kind() == reflect.Ptr {
-						f := fieldValue.Type().Elem()
-						if f.Kind() == reflect.Struct {
-							fieldValue = fieldValue.Elem()
-							if !fieldValue.IsValid() || fieldValue.IsNil() {
-								fieldValue = reflect.New(f).Elem()
-							}
-						}
-
-						parentTable := engine.mapType(fieldValue)
-						for _, col := range parentTable.Columns() {
-							col.FieldName = fmt.Sprintf("%v.%v", t.Field(i).Name, col.FieldName)
-							table.AddColumn(col)
-						}
-
-						continue
-					}
-					//TODO: warning
-				}
-
-				indexNames := make(map[string]int)
-				var isIndex, isUnique bool
-				var preKey string
-				for j, key := range tags {
-					k := strings.ToUpper(key)
-					switch {
-					case k == "<-":
-						col.MapType = core.ONLYFROMDB
-					case k == "->":
-						col.MapType = core.ONLYTODB
-					case k == "PK":
-						col.IsPrimaryKey = true
-						col.Nullable = false
-					case k == "NULL":
-						col.Nullable = (strings.ToUpper(tags[j-1]) != "NOT")
-					/*case strings.HasPrefix(k, "AUTOINCR(") && strings.HasSuffix(k, ")"):
-					col.IsAutoIncrement = true
-
-					autoStart := k[len("AUTOINCR")+1 : len(k)-1]
-					autoStartInt, err := strconv.Atoi(autoStart)
-					if err != nil {
-						engine.LogError(err)
-					}
-					col.AutoIncrStart = autoStartInt*/
-					case k == "AUTOINCR":
-						col.IsAutoIncrement = true
-						//col.AutoIncrStart = 1
-					case k == "DEFAULT":
-						col.Default = tags[j+1]
-					case k == "CREATED":
-						col.IsCreated = true
-					case k == "VERSION":
-						col.IsVersion = true
-						col.Default = "1"
-					case k == "UPDATED":
-						col.IsUpdated = true
-					case k == "DELETED":
-						col.IsDeleted = true
-					case strings.HasPrefix(k, "INDEX(") && strings.HasSuffix(k, ")"):
-						indexName := k[len("INDEX")+1 : len(k)-1]
-						indexNames[indexName] = core.IndexType
-					case k == "INDEX":
-						isIndex = true
-					case strings.HasPrefix(k, "UNIQUE(") && strings.HasSuffix(k, ")"):
-						indexName := k[len("UNIQUE")+1 : len(k)-1]
-						indexNames[indexName] = core.UniqueType
-					case k == "UNIQUE":
-						isUnique = true
-					case k == "NOTNULL":
-						col.Nullable = false
-					case k == "CACHE":
-						if !hasCacheTag {
-							hasCacheTag = true
-						}
-					case k == "NOCACHE":
-						if !hasNoCacheTag {
-							hasNoCacheTag = true
-						}
-					case k == "NOT":
-					default:
-						if strings.HasPrefix(k, "'") && strings.HasSuffix(k, "'") {
-							if preKey != "DEFAULT" {
-								col.Name = key[1 : len(key)-1]
-							}
-						} else if strings.Contains(k, "(") && strings.HasSuffix(k, ")") {
-							fs := strings.Split(k, "(")
-
-							if _, ok := core.SqlTypes[fs[0]]; !ok {
-								preKey = k
-								continue
-							}
-							col.SQLType = core.SQLType{fs[0], 0, 0}
-							if fs[0] == core.Enum && fs[1][0] == '\'' { //enum
-								options := strings.Split(fs[1][0:len(fs[1])-1], ",")
-								col.EnumOptions = make(map[string]int)
-								for k, v := range options {
-									v = strings.TrimSpace(v)
-									v = strings.Trim(v, "'")
-									col.EnumOptions[v] = k
-								}
-							} else if fs[0] == core.Set && fs[1][0] == '\'' { //set
-								options := strings.Split(fs[1][0:len(fs[1])-1], ",")
-								col.SetOptions = make(map[string]int)
-								for k, v := range options {
-									v = strings.TrimSpace(v)
-									v = strings.Trim(v, "'")
-									col.SetOptions[v] = k
-								}
-							} else {
-								fs2 := strings.Split(fs[1][0:len(fs[1])-1], ",")
-								if len(fs2) == 2 {
-									col.Length, err = strconv.Atoi(fs2[0])
-									if err != nil {
-										engine.LogError(err)
-									}
-									col.Length2, err = strconv.Atoi(fs2[1])
-									if err != nil {
-										engine.LogError(err)
-									}
-								} else if len(fs2) == 1 {
-									col.Length, err = strconv.Atoi(fs2[0])
-									if err != nil {
-										engine.LogError(err)
-									}
-								}
-							}
-						} else {
-							if _, ok := core.SqlTypes[k]; ok {
-								col.SQLType = core.SQLType{k, 0, 0}
-							} else if key != col.Default {
-								col.Name = key
-							}
-						}
-						engine.dialect.SqlType(col)
-					}
-					preKey = k
-				}
-				if col.SQLType.Name == "" {
-					col.SQLType = core.Type2SQLType(fieldType)
-				}
-				if col.Length == 0 {
-					col.Length = col.SQLType.DefaultLength
-				}
-				if col.Length2 == 0 {
-					col.Length2 = col.SQLType.DefaultLength2
-				}
-
-				if col.Name == "" {
-					col.Name = engine.ColumnMapper.Obj2Table(t.Field(i).Name)
-				}
-
-				if isUnique {
-					indexNames[col.Name] = core.UniqueType
-				} else if isIndex {
-					indexNames[col.Name] = core.IndexType
-				}
-
-				for indexName, indexType := range indexNames {
-					addIndex(indexName, table, col, indexType)
-				}
-			}
-		} else {
-			var sqlType core.SQLType
-			if fieldValue.CanAddr() {
-				if _, ok := fieldValue.Addr().Interface().(core.Conversion); ok {
-					sqlType = core.SQLType{core.Text, 0, 0}
-				}
-			}
-			if _, ok := fieldValue.Interface().(core.Conversion); ok {
-				sqlType = core.SQLType{core.Text, 0, 0}
-			} else {
-				sqlType = core.Type2SQLType(fieldType)
-			}
-			col = core.NewColumn(engine.ColumnMapper.Obj2Table(t.Field(i).Name),
-				t.Field(i).Name, sqlType, sqlType.DefaultLength,
-				sqlType.DefaultLength2, true)
-		}
-		if col.IsAutoIncrement {
-			col.Nullable = false
-		}
-
-		table.AddColumn(col)
-
-		if fieldType.Kind() == reflect.Int64 && (col.FieldName == "Id" || strings.HasSuffix(col.FieldName, ".Id")) {
-			idFieldColName = col.Name
-		}
 	} // end for
 
 	if idFieldColName != "" && len(table.PrimaryKeys) == 0 {
@@ -945,6 +1092,7 @@ func (engine *Engine) mapType(v reflect.Value) *core.Table {
 
 	return table
 }
+
 
 // Map a struct to a table
 func (engine *Engine) mapping(beans ...interface{}) (e error) {
